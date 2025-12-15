@@ -92,16 +92,19 @@ docker exec -it ollama ollama pull llama3.2:1b
 
 ### ✅ 완료
 - [x] Phase 1 코드베이스 복사
-- [x] Git 저장소 초기화
-- [x] LangChain 의존성 추가
+- [x] Git 저장소 초기화 및 GitHub 푸시
+- [x] LangChain 의존성 추가 (LangChain 0.3.9, LangGraph 0.2.50, LangSmith 0.1.145)
 - [x] README 작성
+- [x] **LangSmith 설정** - API 키 발급 및 .env 설정 완료
+- [x] **RAG Chain 구현** (`chains/rag_chain.py`) - LCEL 기반, Few-shot 통합
+- [x] **ChatGraph 구현** (`graphs/chat_graph.py`) - Two-Tier Intent Classification 워크플로
 
 ### 🚧 진행 중
-- [ ] LangSmith 설정 및 테스트
-- [ ] RAG Chain 구현 (`chains/rag_chain.py`)
+- [ ] API 엔드포인트 통합 (ChatGraph 적용)
 - [ ] SQL Chain 구현 (`chains/sql_chain.py`)
-- [ ] ChatGraph 구현 (`graphs/chat_graph.py`)
 - [ ] Hybrid Search Graph 구현 (`graphs/hybrid_graph.py`)
+- [ ] Docker 환경 테스트
+- [ ] LangSmith 추적 검증
 
 ---
 
