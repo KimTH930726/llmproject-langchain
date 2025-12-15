@@ -1,0 +1,29 @@
+# 빌드 스테이지 - 오프라인용 (node_modules 사전 다운로드 필요)
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# 모든 파일 복사 (node_modules 포함)
+# 주의: docker build 전에 반드시 node_modules가 frontend/ 디렉토리에 존재해야 함
+# .dockerignore에 node_modules가 있으면 복사되지 않으므로,
+# 방식 B 사용 시 임시로 .dockerignore에서 node_modules 제거하거나
+# mv .dockerignore .dockerignore.bak && docker build ... && mv .dockerignore.bak .dockerignore
+COPY . .
+
+# 프로덕션 빌드 (사전 다운로드된 node_modules 사용)
+RUN npm run build
+
+# 프로덕션 스테이지 - nginx 사용
+FROM nginx:alpine
+
+# 빌드된 파일을 nginx 디렉토리로 복사
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# nginx 설정 복사
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+# 포트 노출
+EXPOSE 80
+
+# nginx 실행
+CMD ["nginx", "-g", "daemon off;"]

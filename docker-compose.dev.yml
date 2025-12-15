@@ -1,0 +1,123 @@
+version: '3.8'
+
+services:
+  # PostgreSQL 데이터베이스
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin123
+      POSTGRES_DB: applicants_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql  # 초기화 스크립트
+    networks:
+      - dev-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d applicants_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Ollama LLM 서비스
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - dev-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Qdrant 벡터 데이터베이스
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"  # gRPC port
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - dev-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 5 bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # 백엔드 서비스 (FastAPI)
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: backend
+    ports:
+      - "8000:8000"
+    environment:
+      # PostgreSQL 설정
+      DATABASE_URL: postgresql://admin:admin123@postgres:5432/applicants_db
+      DB_SCHEMA: public
+      # Ollama 설정
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: llama3.2:1b
+      # Qdrant 설정
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION_NAME: documents
+      # FastEmbed 임베딩 모델 설정
+      EMBEDDING_MODEL: sentence-transformers/paraphrase-multilingual-mpnet-base-v2
+      FASTEMBED_CACHE_PATH: /app/fastembed_cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    networks:
+      - dev-network
+    restart: unless-stopped
+    volumes:
+      - ./backend/app:/app/app  # 핫 리로드를 위한 볼륨 마운트
+      - ./backend/fastembed_cache:/app/fastembed_cache  # 임베딩 모델 캐시
+
+  # 프론트엔드 서비스 (React + Nginx)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+networks:
+  dev-network:
+    name: llmproject-backend
+    external: true
+
+volumes:
+  postgres_data:
+    driver: local
+  ollama_data:
+    driver: local
+  qdrant_data:
+    driver: local

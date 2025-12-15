@@ -1,0 +1,56 @@
+version: '3.8'
+
+# =====================================================
+# 폐쇄망 배포용 Docker Compose 설정
+# =====================================================
+# 방식 A (빌드 이미지 전송): 아래 주석 참고하여 수정
+# 방식 B (베이스+패키지 전송): 현재 설정 그대로 사용
+# =====================================================
+
+services:
+  # 백엔드 서비스 (FastAPI)
+  backend:
+    # ===== 방식 B 사용 시 (기본값) =====
+    build:
+      context: .
+      dockerfile: backend/Dockerfile.offline
+
+    # ===== 방식 A 사용 시 =====
+    # 위 build 섹션 주석 처리하고 아래 주석 해제:
+    # image: llmproject-backend:latest
+
+    container_name: llmproject-backend-kth
+    ports:
+      - "1043:8000"
+    env_file:
+      - ./backend/.env  # .env 파일에서 환경 변수 로드
+    volumes:
+      - ./backend/fastembed_cache:/app/fastembed_cache  # 임베딩 모델 캐시 (필수!)
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # 프론트엔드 서비스 (React + Nginx)
+  frontend:
+    # ===== 방식 B 사용 시 (기본값) =====
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.offline
+
+    # ===== 방식 A 사용 시 =====
+    # 위 build 섹션 주석 처리하고 아래 주석 해제:
+    # image: llmproject-frontend:latest
+
+    container_name: llmproject-backend-kth
+    ports:
+      - "1044:80"
+    depends_on:
+      - backend
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    name: llmproject-backend
+    external: true
