@@ -6,24 +6,45 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 채용 지원자 자기소개서 분석 및 RAG 기반 문서 검색 시스템
 
+**Phase 2 마이그레이션 상태:**
+- Phase 1 (커스텀 RAG) → Phase 2 (LangChain/LangGraph) 전환 중
+- Phase 2 Chains/Graphs 우선 사용, Phase 1 Services는 fallback 또는 미구현 기능용
+- 100% DB 스키마 호환성 유지 (PostgreSQL, Qdrant)
+
 **핵심 기능:**
 1. 지원자 분석 (요약, 키워드 추출, 면접 질문 생성)
 2. RAG 문서 검색 (PDF/DOCX/TXT/XLSX 업로드 → Qdrant 벡터 DB → LLM 답변)
+   - **Phase 2**: LangChain LCEL RAG Chain (200줄 → 50줄)
+   - **Phase 2**: LangGraph ChatGraph (Two-Tier Intent Classification 시각화)
 3. 자연어 SQL 변환 (질의 → SQL → DB 조회 → 결과 해석)
+   - **Phase 1**: 패턴 매칭 SQL Agent (Phase 2: LangChain SQL Agent 예정)
 4. Intent & Few-shot 학습 (키워드 매칭 + LLM 분류, 질의 로그 → Few-shot 예제)
+5. Multi-Stage RAG (Query Decomposition + Relevance Analysis)
+   - **Phase 1**: 커스텀 구현 (Phase 2 마이그레이션 예정)
 
 **배포 환경:** 폐쇄망 서버 (PostgreSQL, Ollama, Qdrant가 이미 실행 중)
 
-**상세 문서:** [README.md](README.md), [DEPLOY.md](DEPLOY.md), [FEWSHOT_FEATURE_GUIDE.md](FEWSHOT_FEATURE_GUIDE.md)
+**상세 문서:**
+- [README.md](README.md) - 프로젝트 개요 및 빠른 시작
+- [DEPLOY.md](DEPLOY.md) - 폐쇄망 배포 가이드
 
 ## Tech Stack
 
+### Phase 1에서 유지
 - **Backend:** FastAPI, SQLModel, Qdrant, FastEmbed (ONNX-based, 778MB vs sentence-transformers 7.97GB)
 - **Frontend:** React 19, TypeScript, Vite 7, Tailwind CSS 4
 - **LLM:** Ollama (llama3.2:1b)
 - **DB:** PostgreSQL 16 (지원자 정보, Intent, Query Logs, Few-shots)
 - **Vector DB:** Qdrant (문서 임베딩)
 - **Embedding Model:** `sentence-transformers/paraphrase-multilingual-mpnet-base-v2` (한국어 지원, 768차원)
+
+### Phase 2에서 추가
+- **LangChain:** 0.3.9 (LCEL Chains, PromptTemplate, OutputParsers)
+- **LangGraph:** 0.2.50 (StateMachine 워크플로, 시각화)
+- **LangSmith:** 0.1.145 (추적, 모니터링, 디버깅)
+- **LangChain Integrations:** langchain-ollama, langchain-qdrant
+
+**의존성 크기:** Phase 1 (767MB) → Phase 2 (~1.2GB)
 
 ## Development Commands
 
@@ -232,6 +253,104 @@ async def _analyze_relevance(
 - **설명 가능성**: 분해 사유 + 연관성 분석으로 AI 답변의 투명성 확보
 - **하이브리드 지원**: `needs_db_query=true` → SQL Agent로 자동 라우팅
 
+#### 8. Phase 2: LangChain LCEL Chain Pattern ([rag_chain.py](backend/app/chains/rag_chain.py))
+Phase 1의 200줄 커스텀 RAG 구현을 LangChain LCEL로 50줄로 축약:
+
+**핵심 구조:**
+```python
+# LCEL Runnable 파이프라인
+self.chain = (
+    {
+        "context": RunnableLambda(self._format_docs),
+        "question": RunnablePassthrough(),
+        "few_shot_examples": RunnableLambda(lambda x: "")
+    }
+    | self.prompt  # ChatPromptTemplate
+    | self.llm     # OllamaLLM
+    | StrOutputParser()
+)
+
+# 사용
+answer = await self.chain.ainvoke({
+    "docs": docs,
+    "question": question,
+    "few_shot_examples": few_shot_examples
+})
+```
+
+**Benefits:**
+- **Async-first**: `ainvoke()` 기본 지원 (Phase 1은 수동으로 async 처리)
+- **LangSmith 자동 추적**: 모든 chain invocation이 자동으로 추적됨
+- **Composable**: `|` 연산자로 체인 확장 용이
+- **표준화**: LangChain 생태계와 호환
+
+**Trade-offs:**
+- Phase 1 대비 1.2GB 의존성 증가 (FastAPI 앱: 767MB → 1.9GB)
+- 폐쇄망 배포 시 추가 패키지 다운로드 필요
+
+#### 9. Phase 2: LangGraph Workflow Pattern ([chat_graph.py](backend/app/graphs/chat_graph.py))
+Two-Tier Intent Classification을 LangGraph StateMachine으로 시각화:
+
+**State 정의:**
+```python
+class ChatState(TypedDict):
+    query: str
+    session: Any
+    intent: str  # "rag_search", "sql_query", "general", "unknown"
+    intent_candidates: List[str]
+    answer: str
+    sources: List[dict]
+    sql: Optional[str]
+    results: Optional[List[dict]]
+```
+
+**Graph 구성:**
+```python
+workflow = StateGraph(ChatState)
+
+# 노드 추가
+workflow.add_node("check_intent", check_intent_table)  # Tier 1
+workflow.add_node("classify_llm", classify_with_llm)   # Tier 2
+workflow.add_node("rag", execute_rag)
+workflow.add_node("sql", execute_sql)
+workflow.add_node("general", execute_general)
+
+# 조건부 라우팅
+workflow.add_conditional_edges(
+    "check_intent",
+    route_by_intent,  # intent에 따라 분기
+    {
+        "classify_llm": "classify_llm",
+        "rag": "rag",
+        "sql": "sql",
+        "general": "general"
+    }
+)
+```
+
+**Why LangGraph:**
+- **시각화**: Mermaid 다이어그램으로 워크플로 자동 생성 (디버깅 용이)
+- **상태 관리**: ChatState 중앙 집중식 관리 (Phase 1은 변수 전달)
+- **확장성**: 새 노드/엣지 추가가 직관적 (if/else 분기보다 유지보수 쉬움)
+- **LangSmith 통합**: 각 노드의 입/출력이 자동으로 추적됨
+
+**사용 예:**
+```python
+# API에서 사용 (chat.py)
+chat_graph = get_chat_graph()
+result = await chat_graph.ainvoke({
+    "query": "계약서에서 금액은?",
+    "session": session,
+    "intent": "unknown",
+    "intent_candidates": [],
+    "answer": "",
+    "sources": [],
+    "sql": None,
+    "results": None
+})
+# result["answer"], result["intent"], result["sources"] 사용
+```
+
 ### 데이터베이스 스키마 (PostgreSQL)
 - `applicant_info`: 지원자 정보 (읽기 전용, CRUD 없음)
 - `intents`: 키워드 → intent_type 매핑 (Two-tier 분류 Tier 1)
@@ -246,16 +365,20 @@ async def _analyze_relevance(
 backend/app/
 ├── api/              # API 엔드포인트
 │   ├── analysis.py   # 지원자 분석 API
-│   ├── chat.py       # RAG 채팅 API (QueryRouter 사용)
+│   ├── chat.py       # RAG 채팅 API (Phase 2: ChatGraph 사용)
 │   ├── upload.py     # 문서 업로드 API
 │   ├── intent.py     # Intent 관리 API
 │   ├── query_log.py  # Query Log 관리 API
 │   └── fewshot.py    # Few-shot 관리 API
+├── chains/           # Phase 2: LangChain LCEL Chains
+│   └── rag_chain.py  # RAG Chain (200줄 → 50줄)
+├── graphs/           # Phase 2: LangGraph 워크플로
+│   └── chat_graph.py # ChatGraph (Two-Tier Intent Classification)
 ├── models/           # 데이터 모델 (SQLModel)
-├── services/         # 비즈니스 로직 (싱글톤)
+├── services/         # 비즈니스 로직 (싱글톤, Phase 1 fallback)
 │   ├── ollama_service.py   # LLM 호출
 │   ├── qdrant_service.py   # 벡터 DB 검색
-│   ├── rag_service.py      # RAG 파이프라인
+│   ├── rag_service.py      # RAG 파이프라인 (Phase 1 fallback)
 │   ├── query_router.py     # Intent 분류 (Two-tier)
 │   └── sql_agent.py        # NL→SQL 변환
 ├── database.py       # DB 연결 및 세션 관리
@@ -271,9 +394,15 @@ backend/app/
 - `QDRANT_URL`: Qdrant API (예: `http://qdrant:6333`)
 - `FASTEMBED_CACHE_PATH`: FastEmbed 모델 캐시 디렉토리 (예: `/app/fastembed_cache`)
 
+**Phase 2 필수 (LangSmith):**
+- `LANGCHAIN_API_KEY`: LangSmith API 키 (https://smith.langchain.com에서 발급)
+- `LANGCHAIN_TRACING_V2`: `true` (LangSmith 추적 활성화)
+- `LANGCHAIN_PROJECT`: `llmproject-phase2` (프로젝트 이름)
+
 **선택:**
 - `QDRANT_COLLECTION_NAME`: `documents` (default)
 - `EMBEDDING_MODEL`: `sentence-transformers/paraphrase-multilingual-mpnet-base-v2` (default)
+- `DB_SCHEMA`: `public` (default)
 
 ## Development Workflow
 
@@ -299,6 +428,91 @@ docker-compose up -d --build backend
 - API 문서: http://localhost:8000/docs
 - Intent 분류 디버깅: `POST /api/chat/classify {"query": "..."}`
 - 질의 분해 디버깅: `POST /api/chat/decompose {"query": "..."}`
+- LangSmith 추적 확인: https://smith.langchain.com → Projects → llmproject-phase2
+
+### Phase 2 개발 가이드
+
+#### LangChain Chain 추가
+1. **`backend/app/chains/` 디렉토리에 새 Chain 생성**
+   ```python
+   # backend/app/chains/new_chain.py
+   from langchain_core.prompts import ChatPromptTemplate
+   from langchain_core.output_parsers import StrOutputParser
+   from langchain_ollama import OllamaLLM
+
+   class NewChain:
+       def __init__(self):
+           self.llm = OllamaLLM(...)
+           self.prompt = ChatPromptTemplate.from_messages([...])
+           self.chain = self.prompt | self.llm | StrOutputParser()
+
+       async def invoke(self, input_data):
+           return await self.chain.ainvoke(input_data)
+   ```
+
+2. **싱글톤 인스턴스 생성**
+   ```python
+   _new_chain_instance = None
+
+   def get_new_chain():
+       global _new_chain_instance
+       if _new_chain_instance is None:
+           _new_chain_instance = NewChain()
+       return _new_chain_instance
+   ```
+
+3. **API 또는 Graph에서 사용**
+   ```python
+   from app.chains.new_chain import get_new_chain
+
+   new_chain = get_new_chain()
+   result = await new_chain.invoke({"input": "..."})
+   ```
+
+#### LangGraph 워크플로 수정
+1. **`chat_graph.py`에서 새 노드 추가**
+   ```python
+   async def execute_new_task(state: ChatState) -> ChatState:
+       # 노드 로직
+       return state
+
+   workflow.add_node("new_task", execute_new_task)
+   ```
+
+2. **라우팅 엣지 업데이트**
+   ```python
+   workflow.add_conditional_edges(
+       "check_intent",
+       route_by_intent,
+       {
+           "new_task": "new_task",  # 새 엣지 추가
+           # 기존 엣지 유지...
+       }
+   )
+   ```
+
+3. **ChatState에 필드 추가** (필요한 경우)
+   ```python
+   class ChatState(TypedDict):
+       # 기존 필드...
+       new_field: Optional[str]
+   ```
+
+#### LangSmith 디버깅
+1. **추적 확인**: https://smith.langchain.com → llmproject-phase2
+2. **특정 Chain만 추적 비활성화**:
+   ```python
+   from langsmith import traceable
+
+   @traceable(run_type="chain", name="my_custom_chain")
+   async def my_function(...):
+       # 커스텀 이름으로 추적
+   ```
+
+3. **환경 변수로 추적 off**:
+   ```bash
+   LANGCHAIN_TRACING_V2=false docker-compose restart backend
+   ```
 
 ### 성능 특성 이해
 **예상 응답 시간 (llama3.2:1b 기준):**
@@ -381,9 +595,11 @@ docker network connect dev-network backend
 - **Manual Few-shot Curation**: Query logs → 관리 UI 검토 → 승격 버튼 (자동 승격 없음)
 - **Audit Trail**: PostgreSQL 트리거로 Few-shot 변경 이력 자동 기록
 - **Korean-Only**: 모든 프롬프트 한국어 (다국어 지원 없음)
-- **No Heavy Frameworks**: LangChain 없음 (커스텀 RAG), Alembic 없음 (수동 마이그레이션)
+- **Phase 2 Migration**: LangChain/LangGraph 추가 (1.2GB 의존성), Phase 1 서비스는 fallback으로 유지
+- **Hybrid Architecture**: Phase 2 Chains/Graphs 우선 사용, Phase 1 Services는 호환성 유지 또는 미구현 기능용
 - **Offline Deployment**: `Dockerfile.offline` + 사전 다운로드된 패키지 사용 ([DEPLOY.md](DEPLOY.md))
 - **Security**: SQL Agent는 패턴 매칭만 사용 (동적 SQL 실행 금지, SQL injection 방지)
+- **LangSmith Requirement**: Phase 2 기능 사용 시 LangSmith API 키 필수 (무료 Developer 플랜 가능)
 
 ## Quick Reference
 
@@ -411,9 +627,72 @@ docker exec backend curl -X POST http://ollama:11434/api/generate \
 4. **DB 연결 실패**: `.env` `DATABASE_URL` 확인, 네트워크 연결 확인
 5. **임베딩 모델 로드 실패**: `FASTEMBED_CACHE_PATH` 볼륨 마운트 확인
 
+### Phase 2 전용 디버깅
+1. **LangSmith 추적 안됨**:
+   - `.env`에서 `LANGCHAIN_TRACING_V2=true` 확인
+   - `LANGCHAIN_API_KEY` 유효성 확인 (https://smith.langchain.com/settings)
+   - Backend 로그에서 "LangSmith tracing enabled" 메시지 확인
+
+2. **ChatGraph 실행 오류**:
+   - `docker logs backend`에서 LangGraph 에러 확인
+   - ChatState의 모든 필드가 초기화되었는지 확인
+   - 노드 함수가 async로 정의되었는지 확인
+
+3. **RAG Chain 실행 오류**:
+   - Qdrant collection이 존재하는지 확인: `curl http://localhost:6333/collections`
+   - FastEmbed 모델이 로드되었는지 확인: backend 로그에서 "Loading model" 메시지
+   - LCEL Chain 구성 확인: `self.chain` 파이프라인 오류
+
+4. **Phase 1 fallback 확인**:
+   - `/api/chat/enhanced` (Phase 1 Multi-Stage RAG) vs `/api/chat/` (Phase 2 ChatGraph)
+   - `api/chat.py`에서 어느 구현을 사용하는지 확인
+   - Phase 1 services는 여전히 유효함 (rag_service, sql_agent, ollama_service)
+
 ## Key Request Flows
 
-### 전체 Chat 요청 플로우 (Two-Tier + Few-Shot)
+### Phase 2: ChatGraph 요청 플로우 (LangGraph)
+```
+[POST /api/chat/] {"query": "계약서에서 금액은?"}
+    ↓
+[chat.py:18] ChatGraph.ainvoke({query, session, intent="unknown", ...})
+    ↓
+[chat_graph.py] check_intent_table(state)
+    ├─→ [query_router.py:107] _check_intent_table(query, session)
+    │   ├─→ "계약서" LIKE 검색 → intents 테이블 매칭 (1개)
+    │   └─→ state["intent"] = "rag_search" (Tier 1 완료, LLM 호출 없음)
+    ↓
+[chat_graph.py] route_by_intent(state) → returns "rag"
+    ↓
+[chat_graph.py] execute_rag(state)
+    └─→ RAGChain.invoke(query, session, top_k=3)
+        ├─→ [rag_chain.py:153] vectorstore.similarity_search(query) → Qdrant 검색
+        ├─→ [rag_chain.py:163] _get_active_fewshots(session, "rag_search")
+        ├─→ [rag_chain.py:166] LCEL Chain 실행
+        │   └─→ format_docs | prompt | ollama | parser
+        │   └─→ LangSmith 자동 추적 활성화!
+        └─→ [rag_chain.py:173] return {"answer": ..., "sources": [...]}
+    ↓
+[chat_graph.py] state["answer"] = result["answer"]
+[chat_graph.py] state["sources"] = result["sources"]
+    ↓
+[chat.py:76] QueryLog 생성 및 DB 저장
+    └─→ query_text, detected_intent, response, created_at 기록
+    ↓
+[chat.py:82] return ChatResponse(answer=..., intent=...)
+```
+
+**핵심 경로 파일 (Phase 2):**
+- [chat.py](backend/app/api/chat.py) - 메인 라우터
+- [chat_graph.py](backend/app/graphs/chat_graph.py) - LangGraph 워크플로
+- [rag_chain.py](backend/app/chains/rag_chain.py) - LangChain LCEL RAG Chain
+- [query_router.py](backend/app/services/query_router.py) - Two-tier 분류 (재사용)
+- [qdrant_service.py](backend/app/services/qdrant_service.py) - 벡터 검색 (재사용)
+
+**LangSmith 추적 확인:**
+- https://smith.langchain.com → Projects → llmproject-phase2
+- 각 요청의 ChatGraph 노드별 입/출력, LCEL Chain 단계별 처리 시간 확인 가능
+
+### Phase 1: 전체 Chat 요청 플로우 (커스텀 구현, fallback)
 ```
 [POST /api/chat/] {"query": "계약서에서 금액은?"}
     ↓
