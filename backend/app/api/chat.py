@@ -1,18 +1,23 @@
 """
-채팅 API
-QueryRouter로 의도를 분류하고 RAG 또는 SQL Agent로 응답 생성
+채팅 API - Phase 2: ChatGraph 통합
+
+Phase 1: QueryRouter + if/else 분기
+Phase 2: LangGraph ChatGraph (시각화된 워크플로)
 """
 from fastapi import APIRouter, HTTPException, Depends
 from sqlmodel import Session
 
 from app.models.chat import ChatRequest, ChatResponse, QueryDecomposition, RelevanceAnalysis
 from app.models.query_log import QueryLog
+from app.graphs.chat_graph import get_chat_graph  # Phase 2: ChatGraph
+from app.services.query_decomposer import query_decomposer
+from app.database import get_session
+
+# Phase 1 imports (fallback용)
 from app.services.query_router import query_router, QueryIntent
 from app.services.rag_service import rag_service
 from app.services.sql_agent import sql_agent
 from app.services.ollama_service import ollama_service
-from app.services.query_decomposer import query_decomposer
-from app.database import get_session
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -25,59 +30,49 @@ async def chat(
     """
     사용자 질의에 대해 적절한 방식으로 응답 생성
 
+    Phase 2: LangGraph ChatGraph 워크플로 사용
+    - Two-Tier Intent Classification (시각화)
+    - LangSmith 자동 추적
+    - 상태 기반 실행
+
     흐름:
-    1. QueryRouter로 의도 분류 (RAG / SQL / General)
-    2. RAG: Qdrant에서 문서 검색 후 LLM으로 답변
-    3. SQL: 자연어를 SQL로 변환하여 DB 조회 후 답변
-    4. General: LLM으로 직접 응답
-    5. 질의와 응답을 query_logs 테이블에 자동 저장
+    1. ChatGraph 실행 (check_intent → classify_llm → rag/sql/general)
+    2. 질의 로그 자동 저장
+    3. LangSmith에 추적 기록
 
     - query: 사용자 질의
     """
     query = request.query
-    answer = None
-    intent_value = None
 
     try:
-        # 1. 의도 분류 (intents 테이블 우선, 없으면 LLM으로 분류)
-        intent = await query_router.classify_intent_simple(query, session=session)
-        intent_value = intent.value
+        # Phase 2: ChatGraph 실행 (LangGraph 워크플로)
+        chat_graph = get_chat_graph()
 
-        # 2. 의도별 처리 (모든 서비스에 session 전달하여 Few-shot 예제 활용)
-        if intent == QueryIntent.RAG_SEARCH:
-            # RAG 검색
-            result = await rag_service.answer_question(query, top_k=3, session=session)
-            answer = result["answer"]
-            response = ChatResponse(
-                answer=answer,
-                intent=intent_value,
-                sources=result.get("sources", [])
-            )
+        result = await chat_graph.ainvoke({
+            "query": query,
+            "session": session,
+            "intent": "unknown",
+            "intent_candidates": [],
+            "answer": "",
+            "sources": [],
+            "sql": None,
+            "results": None
+        })
 
-        elif intent == QueryIntent.SQL_QUERY:
-            # SQL Agent 실행 (Few-shot 포함)
-            result = await sql_agent.execute_query(query, session=session)
-            answer = result["answer"]
-            response = ChatResponse(
-                answer=answer,
-                intent=intent_value,
-                sql=result.get("sql"),
-                results=result.get("results")
-            )
+        # ChatGraph 결과에서 응답 생성
+        response = ChatResponse(
+            answer=result["answer"],
+            intent=result["intent"],
+            sources=result.get("sources", []),
+            sql=result.get("sql"),
+            results=result.get("results")
+        )
 
-        else:  # QueryIntent.GENERAL
-            # 일반 대화 (Few-shot 포함)
-            answer = await ollama_service.generate_with_fewshot(query, session=session, intent_type="general")
-            response = ChatResponse(
-                answer=answer,
-                intent=intent_value
-            )
-
-        # 3. 질의 로그 자동 저장
+        # 질의 로그 자동 저장
         query_log = QueryLog(
             query_text=query,
-            detected_intent=intent_value,
-            response=answer
+            detected_intent=result["intent"],
+            response=result["answer"]
         )
         session.add(query_log)
         session.commit()
