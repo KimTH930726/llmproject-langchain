@@ -14,8 +14,6 @@ from langchain_qdrant import QdrantVectorStore
 from qdrant_client import QdrantClient
 from fastembed import TextEmbedding
 
-from app.models.few_shot import FewShot
-
 
 class RAGChain:
     """
@@ -40,6 +38,7 @@ class RAGChain:
         self.qdrant_url = qdrant_url or os.getenv("QDRANT_URL", "http://qdrant:6333")
         self.collection_name = collection_name or os.getenv("QDRANT_COLLECTION_NAME", "documents")
         self.embedding_model_name = embedding_model or os.getenv("EMBEDDING_MODEL")
+        self.fastembed_cache = os.getenv("FASTEMBED_CACHE_PATH", "/app/fastembed_cache")
 
         # LangChain Ollama LLM
         self.llm = OllamaLLM(
@@ -48,20 +47,10 @@ class RAGChain:
             temperature=0.7
         )
 
-        # FastEmbed (Phase 1과 동일한 임베딩 모델 사용)
-        fastembed_cache = os.getenv("FASTEMBED_CACHE_PATH", "/app/fastembed_cache")
-        self.embedding = TextEmbedding(
-            model_name=self.embedding_model_name,
-            cache_dir=fastembed_cache
-        )
-
-        # Qdrant Client 및 Vector Store
-        self.qdrant_client = QdrantClient(url=self.qdrant_url)
-        self.vectorstore = QdrantVectorStore(
-            client=self.qdrant_client,
-            collection_name=self.collection_name,
-            embedding=self.embedding
-        )
+        # Lazy initialization for FastEmbed and Qdrant
+        self._embedding = None
+        self._qdrant_client = None
+        self._vectorstore = None
 
         # Few-shot 프롬프트 템플릿 (Phase 1과 동일한 구조)
         self.prompt = ChatPromptTemplate.from_messages([
@@ -88,6 +77,34 @@ class RAGChain:
             | StrOutputParser()
         )
 
+    @property
+    def embedding(self):
+        """Lazy load FastEmbed model"""
+        if self._embedding is None:
+            self._embedding = TextEmbedding(
+                model_name=self.embedding_model_name,
+                cache_dir=self.fastembed_cache
+            )
+        return self._embedding
+
+    @property
+    def qdrant_client(self):
+        """Lazy load Qdrant client"""
+        if self._qdrant_client is None:
+            self._qdrant_client = QdrantClient(url=self.qdrant_url)
+        return self._qdrant_client
+
+    @property
+    def vectorstore(self):
+        """Lazy load Qdrant vector store"""
+        if self._vectorstore is None:
+            self._vectorstore = QdrantVectorStore(
+                client=self.qdrant_client,
+                collection_name=self.collection_name,
+                embedding=self.embedding
+            )
+        return self._vectorstore
+
     def _format_docs(self, docs: List[Any]) -> str:
         """검색된 문서를 컨텍스트 문자열로 변환"""
         if not docs:
@@ -103,34 +120,19 @@ class RAGChain:
 
     def _get_active_fewshots(self, session: Optional[Session], intent_type: str = "rag_search") -> str:
         """
-        Few-shot 예제 조회 (Phase 1과 동일한 로직)
+        Few-shot 예제 조회 (Tool-based Agent에서는 Agent 레벨에서 처리)
+
+        Note: Tool-based 아키텍처에서는 Agent가 few-shot을 시스템 프롬프트에 주입하므로
+        이 메서드는 항상 빈 문자열을 반환합니다.
 
         Args:
             session: DB 세션
             intent_type: Intent 타입
 
         Returns:
-            포맷팅된 Few-shot 예제 문자열
+            빈 문자열 (Few-shot은 Agent 레벨에서 처리)
         """
-        if not session:
-            return ""
-
-        few_shots = session.exec(
-            select(FewShot)
-            .where(FewShot.is_active == True)
-            .where(FewShot.intent_type == intent_type)
-            .order_by(FewShot.created_at.desc())
-            .limit(3)  # 최대 3개
-        ).all()
-
-        if not few_shots:
-            return ""
-
-        examples = []
-        for fs in few_shots:
-            examples.append(f"예시 질문: {fs.user_query}\n예시 답변: {fs.expected_response}")
-
-        return "참고할 예시:\n" + "\n\n".join(examples) + "\n"
+        return ""
 
     async def invoke(
         self,

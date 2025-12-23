@@ -1,12 +1,12 @@
 """
-LangGraph Workflows - Phase 2
+LangGraph Workflows - Tool-based Agent
 
-상태 기반 워크플로 구현
+ReAct Agent 패턴 구현
 """
-from app.graphs.chat_graph import ChatState, get_chat_graph, create_chat_graph
+from app.graphs.agent_graph import AgentState, get_agent_graph, create_agent_graph
 
 __all__ = [
-    "ChatState",
-    "get_chat_graph",
-    "create_chat_graph",
+    "AgentState",
+    "get_agent_graph",
+    "create_agent_graph",
 ]
