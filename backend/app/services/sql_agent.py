@@ -1,12 +1,12 @@
 """
 SQL Agent - 자연어 질의를 SQL로 변환하고 실행
 PostgreSQL 데이터베이스 조회 및 결과 해석
+Tool-based 아키텍처: Few-shot은 Agent 레벨에서 처리
 """
 from typing import Dict, Any, List, Optional
 from sqlmodel import Session, select
 from app.services.ollama_service import ollama_service
 from app.models.applicant import Applicant
-from app.models.few_shot import FewShot
 
 
 class SQLAgent:
@@ -19,6 +19,8 @@ class SQLAgent:
         """
         자연어 질의를 SQL로 변환하고 실행
 
+        Tool-based 아키텍처에서는 Few-shot이 Agent 레벨에서 처리됩니다.
+
         Args:
             query: 사용자 질의
             session: 데이터베이스 세션
@@ -26,13 +28,10 @@ class SQLAgent:
         Returns:
             실행 결과 및 자연어 답변
         """
-        # 1. Few-shot 예제 가져오기
-        few_shots = self._get_active_fewshots(session, intent_type="sql_query")
+        # 1. 자연어 -> SQL 변환
+        sql_info = await self._generate_sql(query)
 
-        # 2. 자연어 -> SQL 변환 (Few-shot 포함)
-        sql_info = await self._generate_sql(query, few_shots)
-
-        # 3. SQL 실행
+        # 2. SQL 실행
         try:
             results = self._execute_sql(sql_info, session)
         except Exception as e:
@@ -42,8 +41,8 @@ class SQLAgent:
                 "error": str(e)
             }
 
-        # 4. 결과를 자연어로 해석 (Few-shot 포함)
-        answer = await self._interpret_results(query, results, few_shots)
+        # 3. 결과를 자연어로 해석
+        answer = await self._interpret_results(query, results)
 
         return {
             "answer": answer,
@@ -52,28 +51,12 @@ class SQLAgent:
             "count": len(results)
         }
 
-    def _get_active_fewshots(
-        self,
-        session: Optional[Session],
-        intent_type: Optional[str] = None
-    ) -> List[FewShot]:
-        """Few-shot 예제 가져오기"""
-        if not session:
-            return []
+    async def _generate_sql(self, query: str) -> Dict[str, str]:
+        """
+        자연어를 SQL로 변환
 
-        try:
-            statement = select(FewShot).where(FewShot.is_active == True)
-            if intent_type:
-                statement = statement.where(FewShot.intent_type == intent_type)
-
-            results = session.exec(statement).all()
-            return list(results)
-        except Exception as e:
-            print(f"Few-shot 조회 실패: {e}")
-            return []
-
-    async def _generate_sql(self, query: str, few_shots: List[FewShot] = None) -> Dict[str, str]:
-        """자연어를 SQL로 변환 (Few-shot 예제 포함)"""
+        Tool-based 아키텍처에서는 Few-shot이 Agent 레벨에서 처리됩니다.
+        """
         schema_info = """
 테이블: applicant_info
 컬럼:
@@ -83,29 +66,14 @@ class SQLAgent:
 - skill (VARCHAR): 기술 스택 및 역량
 """
 
-        prompt_parts = []
-
-        # Few-shot 예제 추가
-        if few_shots:
-            prompt_parts.append("다음은 질문-SQL 변환 예제입니다:\n")
-            for idx, fs in enumerate(few_shots, 1):
-                prompt_parts.append(f"예제 {idx}:")
-                prompt_parts.append(f"질문: {fs.user_query}")
-                if fs.expected_response:
-                    prompt_parts.append(f"SQL: {fs.expected_response}")
-                prompt_parts.append("")
-            prompt_parts.append("---\n")
-
-        # 기본 프롬프트
-        prompt_parts.append(f"""다음 데이터베이스 스키마를 참고하여 자연어 질의를 SQL로 변환해주세요.
+        prompt = f"""다음 데이터베이스 스키마를 참고하여 자연어 질의를 SQL로 변환해주세요.
 
 {schema_info}
 
 자연어 질의: {query}
 
-SQL 쿼리만 작성하세요 (SELECT 문):""")
+SQL 쿼리만 작성하세요 (SELECT 문):"""
 
-        prompt = "\n".join(prompt_parts)
         sql = await self.ollama.generate(prompt)
 
         # SQL 정제 (주석, 설명 제거)
@@ -163,38 +131,27 @@ SQL 쿼리만 작성하세요 (SELECT 문):""")
 
         return []
 
-    async def _interpret_results(self, query: str, results: List[Dict[str, Any]], few_shots: List[FewShot] = None) -> str:
-        """SQL 실행 결과를 자연어로 해석 (Few-shot 예제 포함)"""
+    async def _interpret_results(self, query: str, results: List[Dict[str, Any]]) -> str:
+        """
+        SQL 실행 결과를 자연어로 해석
+
+        Tool-based 아키텍처에서는 Few-shot이 Agent 레벨에서 처리됩니다.
+        """
         if not results:
             return "조회 결과가 없습니다."
 
         # 결과 요약
         result_summary = str(results)[:500]  # 최대 500자
 
-        prompt_parts = []
-
-        # Few-shot 예제 추가
-        if few_shots:
-            prompt_parts.append("다음은 결과 해석 예제입니다:\n")
-            for idx, fs in enumerate(few_shots, 1):
-                prompt_parts.append(f"예제 {idx}:")
-                prompt_parts.append(f"질문: {fs.user_query}")
-                if fs.expected_response:
-                    prompt_parts.append(f"답변: {fs.expected_response}")
-                prompt_parts.append("")
-            prompt_parts.append("---\n")
-
-        # 기본 프롬프트
-        prompt_parts.append(f"""다음 데이터베이스 조회 결과를 사용자 질문에 맞게 자연어로 설명해주세요.
+        prompt = f"""다음 데이터베이스 조회 결과를 사용자 질문에 맞게 자연어로 설명해주세요.
 
 질문: {query}
 
 조회 결과:
 {result_summary}
 
-자연어 답변:""")
+자연어 답변:"""
 
-        prompt = "\n".join(prompt_parts)
         answer = await self.ollama.generate(prompt)
         return answer
 

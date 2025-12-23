@@ -1,17 +1,18 @@
 """
-채팅 API
-QueryRouter로 의도를 분류하고 RAG 또는 SQL Agent로 응답 생성
+Chat API V2 - Tool-based Agent 아키텍처
+
+기존 Phase 2 (ChatGraph)를 Tool-based Agent로 재구현
+- Intent 테이블 제거
+- LLM이 Tool을 직접 선택
+- ReAct Agent 패턴
 """
 from fastapi import APIRouter, HTTPException, Depends
 from sqlmodel import Session
+from langchain_core.messages import HumanMessage, AIMessage
 
-from app.models.chat import ChatRequest, ChatResponse, QueryDecomposition, RelevanceAnalysis
+from app.models.chat import ChatRequest, ChatResponse
 from app.models.query_log import QueryLog
-from app.services.query_router import query_router, QueryIntent
-from app.services.rag_service import rag_service
-from app.services.sql_agent import sql_agent
-from app.services.ollama_service import ollama_service
-from app.services.query_decomposer import query_decomposer
+from app.graphs.agent_graph import get_agent_graph
 from app.database import get_session
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -23,194 +24,108 @@ async def chat(
     session: Session = Depends(get_session)
 ):
     """
-    사용자 질의에 대해 적절한 방식으로 응답 생성
+    Tool-based Agent를 사용한 채팅 API
 
     흐름:
-    1. QueryRouter로 의도 분류 (RAG / SQL / General)
-    2. RAG: Qdrant에서 문서 검색 후 LLM으로 답변
-    3. SQL: 자연어를 SQL로 변환하여 DB 조회 후 답변
-    4. General: LLM으로 직접 응답
-    5. 질의와 응답을 query_logs 테이블에 자동 저장
+    1. 사용자 질의 → Agent Graph
+    2. Agent가 Tool 선택 (search_documents, query_database, general_conversation)
+    3. Tool 실행 → 결과 반환
+    4. Query Log 자동 저장
 
-    - query: 사용자 질의
+    장점:
+    - Intent 테이블 불필요 (LLM이 직접 추론)
+    - 확장성: 새 Tool 추가만으로 기능 확장
+    - 표준 패턴: LangGraph + ToolNode
     """
     query = request.query
-    answer = None
-    intent_value = None
 
     try:
-        # 1. 의도 분류 (intents 테이블 우선, 없으면 LLM으로 분류)
-        intent = await query_router.classify_intent_simple(query, session=session)
-        intent_value = intent.value
+        # Agent Graph 가져오기
+        agent_graph = get_agent_graph()
 
-        # 2. 의도별 처리 (모든 서비스에 session 전달하여 Few-shot 예제 활용)
-        if intent == QueryIntent.RAG_SEARCH:
-            # RAG 검색
-            result = await rag_service.answer_question(query, top_k=3, session=session)
-            answer = result["answer"]
-            response = ChatResponse(
-                answer=answer,
-                intent=intent_value,
-                sources=result.get("sources", [])
-            )
+        # 초기 상태 구성
+        initial_state = {
+            "messages": [HumanMessage(content=query)],
+            "session_context": {"session": session}
+        }
 
-        elif intent == QueryIntent.SQL_QUERY:
-            # SQL Agent 실행 (Few-shot 포함)
-            result = await sql_agent.execute_query(query, session=session)
-            answer = result["answer"]
-            response = ChatResponse(
-                answer=answer,
-                intent=intent_value,
-                sql=result.get("sql"),
-                results=result.get("results")
-            )
+        # Agent 실행 (LangSmith 자동 추적)
+        result = await agent_graph.ainvoke(initial_state)
 
-        else:  # QueryIntent.GENERAL
-            # 일반 대화 (Few-shot 포함)
-            answer = await ollama_service.generate_with_fewshot(query, session=session, intent_type="general")
-            response = ChatResponse(
-                answer=answer,
-                intent=intent_value
-            )
+        # 최종 메시지 추출
+        messages = result["messages"]
+        last_message = messages[-1]
 
-        # 3. 질의 로그 자동 저장
+        # AIMessage의 content 추출
+        if isinstance(last_message, AIMessage):
+            answer = last_message.content
+        else:
+            answer = str(last_message)
+
+        # Query Log 저장
         query_log = QueryLog(
             query_text=query,
-            detected_intent=intent_value,
-            response=answer
+            response=answer,
+            detected_intent=None  # Intent 분류 제거
         )
         session.add(query_log)
         session.commit()
 
-        return response
+        return ChatResponse(
+            answer=answer,
+            intent=None,  # Intent 개념 제거
+            sources=[],   # Tool에서 반환된 정보는 answer에 포함됨
+            query_log_id=query_log.id
+        )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"채팅 처리 실패: {str(e)}")
+        # 에러 로깅
+        print(f"Agent 실행 오류: {e}")
+        import traceback
+        traceback.print_exc()
+
+        # Query Log에 에러 기록
+        error_log = QueryLog(
+            query_text=query,
+            response=f"오류 발생: {str(e)}",
+            detected_intent=None
+        )
+        session.add(error_log)
+        session.commit()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Agent 실행 중 오류가 발생했습니다: {str(e)}"
+        )
 
 
-@router.post("/enhanced", response_model=ChatResponse)
-async def chat_enhanced(
-    request: ChatRequest,
+@router.get("/history")
+async def get_chat_history(
+    limit: int = 10,
     session: Session = Depends(get_session)
 ):
     """
-    Multi-Stage RAG: 질의 분해 + 연관성 분석 포함
+    최근 대화 이력 조회
 
-    흐름:
-    1. QueryDecomposer로 질의 분해 (비정형/정형 분류 + 사유)
-    2. Intent 분류 (RAG / SQL / General)
-    3. RAG: 비정형 질의로 검색 + 연관성 분석
-    4. SQL: 정형 질의로 DB 조회 (needs_db_query=true인 경우)
-    5. 결과에 분해 사유 + 연관성 분석 포함
-
-    - query: 사용자 질의
+    Args:
+        limit: 조회할 개수 (기본 10개)
     """
-    query = request.query
-    answer = None
-    intent_value = None
+    from sqlmodel import select, desc
 
-    try:
-        # Stage 1: 질의 분해
-        decomposition_result = await query_decomposer.decompose_query(query)
+    logs = session.exec(
+        select(QueryLog)
+        .order_by(desc(QueryLog.created_at))
+        .limit(limit)
+    ).all()
 
-        # Stage 2: Intent 분류
-        intent = await query_router.classify_intent_simple(query, session=session)
-        intent_value = intent.value
-
-        # Stage 3: Intent별 처리
-        if intent == QueryIntent.RAG_SEARCH:
-            # 비정형 질의로 RAG 검색 + 연관성 분석
-            search_query = decomposition_result.get("unstructured_query") or query
-
-            result = await rag_service.answer_question_with_analysis(
-                original_query=query,
-                search_query=search_query,
-                top_k=3,
-                session=session
-            )
-
-            answer = result["answer"]
-            response = ChatResponse(
-                answer=answer,
-                intent=intent_value,
-                sources=result.get("sources", []),
-                decomposition=QueryDecomposition(**decomposition_result),
-                relevance_analysis=RelevanceAnalysis(**result.get("relevance_analysis", {
-                    "reasoning": "",
-                    "confidence": 0.0,
-                    "matched_sections": []
-                }))
-            )
-
-        elif intent == QueryIntent.SQL_QUERY or decomposition_result.get("needs_db_query"):
-            # 정형 질의로 SQL 실행
-            structured_query = decomposition_result.get("structured_query") or query
-
-            result = await sql_agent.execute_query(structured_query, session=session)
-            answer = result["answer"]
-            response = ChatResponse(
-                answer=answer,
-                intent=intent_value,
-                sql=result.get("sql"),
-                results=result.get("results"),
-                decomposition=QueryDecomposition(**decomposition_result)
-            )
-
-        else:  # QueryIntent.GENERAL
-            answer = await ollama_service.generate_with_fewshot(query, session=session, intent_type="general")
-            response = ChatResponse(
-                answer=answer,
-                intent=intent_value,
-                decomposition=QueryDecomposition(**decomposition_result)
-            )
-
-        # 질의 로그 자동 저장
-        query_log = QueryLog(
-            query_text=query,
-            detected_intent=intent_value,
-            response=answer
-        )
-        session.add(query_log)
-        session.commit()
-
-        return response
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Enhanced 채팅 처리 실패: {str(e)}")
-
-
-@router.post("/classify")
-async def classify_query(request: ChatRequest, session: Session = Depends(get_session)):
-    """
-    질의 의도 분류만 수행 (디버깅용)
-
-    - query: 사용자 질의
-    """
-    try:
-        intent_simple = await query_router.classify_intent_simple(request.query, session=session)
-        intent_llm = await query_router.classify_intent(request.query)
-
-        return {
-            "query": request.query,
-            "intent_simple": intent_simple.value,
-            "intent_llm": intent_llm.value
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"분류 실패: {str(e)}")
-
-
-@router.post("/decompose")
-async def decompose_query_debug(request: ChatRequest):
-    """
-    질의 분해만 수행 (디버깅용)
-
-    - query: 사용자 질의
-    """
-    try:
-        result = await query_decomposer.decompose_query(request.query)
-        return {
-            "query": request.query,
-            **result
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"질의 분해 실패: {str(e)}")
+    return {
+        "history": [
+            {
+                "id": log.id,
+                "query": log.query_text,
+                "response": log.response,
+                "created_at": log.created_at.isoformat()
+            }
+            for log in logs
+        ]
+    }

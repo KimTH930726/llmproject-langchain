@@ -13,9 +13,10 @@ load_dotenv()
 
 # 오프라인 모드 강제 (폐쇄망 환경에서 HuggingFace Hub 접속 차단)
 # 반드시 TextEmbedding import 전에 설정되어야 함
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_DATASETS_OFFLINE"] = "1"
+# TEMPORARY: Disabled to allow model download
+# os.environ["HF_HUB_OFFLINE"] = "1"
+# os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# os.environ["HF_DATASETS_OFFLINE"] = "1"
 
 
 class QdrantService:
@@ -28,38 +29,49 @@ class QdrantService:
         self.embedding_model_name = os.getenv("EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-mpnet-base-v2")
 
         # FastEmbed 캐시 경로 설정 (폐쇄망 환경)
-        fastembed_cache = os.getenv("FASTEMBED_CACHE_PATH", "/app/fastembed_cache")
+        self.fastembed_cache = os.getenv("FASTEMBED_CACHE_PATH", "/app/fastembed_cache")
 
-        # Qdrant 클라이언트 초기화
-        self.client = QdrantClient(url=self.qdrant_url)
-
-        # FastEmbed 임베딩 모델 로드 (경량, 다국어 지원)
-        # 캐시 경로가 설정되어 있으면 해당 경로에서 모델 로드
-        try:
-            self.embedding_model = TextEmbedding(
-                model_name=self.embedding_model_name,
-                cache_dir=fastembed_cache
-            )
-            print(f"✅ FastEmbed 모델 로드 성공: {self.embedding_model_name}")
-            print(f"   캐시 디렉토리: {fastembed_cache}")
-        except Exception as e:
-            print(f"❌ FastEmbed 모델 로드 실패: {e}")
-            print(f"   캐시 디렉토리: {fastembed_cache}")
-            print(f"   캐시 내용 확인:")
-            if os.path.exists(fastembed_cache):
-                import subprocess
-                result = subprocess.run(["find", fastembed_cache, "-type", "f"],
-                                      capture_output=True, text=True)
-                print(result.stdout)
-            raise
-
+        # Lazy initialization
+        self._client = None
+        self._embedding_model = None
         self.vector_size = 768  # paraphrase-multilingual-mpnet-base-v2 벡터 크기
+        self._collection_initialized = False
 
-        # 컬렉션 생성 (없는 경우)
-        self._ensure_collection()
+    @property
+    def client(self):
+        """Lazy load Qdrant client"""
+        if self._client is None:
+            self._client = QdrantClient(url=self.qdrant_url)
+        return self._client
+
+    @property
+    def embedding_model(self):
+        """Lazy load FastEmbed model"""
+        if self._embedding_model is None:
+            try:
+                self._embedding_model = TextEmbedding(
+                    model_name=self.embedding_model_name,
+                    cache_dir=self.fastembed_cache
+                )
+                print(f"✅ FastEmbed 모델 로드 성공: {self.embedding_model_name}")
+                print(f"   캐시 디렉토리: {self.fastembed_cache}")
+            except Exception as e:
+                print(f"❌ FastEmbed 모델 로드 실패: {e}")
+                print(f"   캐시 디렉토리: {self.fastembed_cache}")
+                print(f"   캐시 내용 확인:")
+                if os.path.exists(self.fastembed_cache):
+                    import subprocess
+                    result = subprocess.run(["find", self.fastembed_cache, "-type", "f"],
+                                          capture_output=True, text=True)
+                    print(result.stdout)
+                raise
+        return self._embedding_model
 
     def _ensure_collection(self):
-        """컬렉션이 없으면 생성"""
+        """컬렉션이 없으면 생성 (lazy)"""
+        if self._collection_initialized:
+            return
+
         collections = self.client.get_collections().collections
         collection_names = [col.name for col in collections]
 
@@ -68,6 +80,8 @@ class QdrantService:
                 collection_name=self.collection_name,
                 vectors_config=VectorParams(size=self.vector_size, distance=Distance.COSINE),
             )
+
+        self._collection_initialized = True
 
     def add_document(self, doc_id: str, text: str, metadata: Dict[str, Any] = None) -> None:
         """
@@ -78,6 +92,9 @@ class QdrantService:
             text: 문서 텍스트
             metadata: 추가 메타데이터 (파일명, 업로드 시간 등)
         """
+        # Ensure collection exists
+        self._ensure_collection()
+
         # 텍스트를 임베딩 벡터로 변환 (FastEmbed은 generator 반환)
         embeddings = list(self.embedding_model.embed([text]))
         vector = embeddings[0].tolist()
@@ -109,6 +126,9 @@ class QdrantService:
         Returns:
             검색 결과 리스트 (각 결과는 text, score, metadata 포함)
         """
+        # Ensure collection exists
+        self._ensure_collection()
+
         # 쿼리를 임베딩 벡터로 변환 (FastEmbed)
         embeddings = list(self.embedding_model.embed([query]))
         query_vector = embeddings[0].tolist()
