@@ -25,3 +25,6 @@ ENV/
 
 # OS
 .DS_Store
+
+# FastEmbed cache
+fastembed_cache/
