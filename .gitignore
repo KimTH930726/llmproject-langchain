@@ -53,3 +53,8 @@ export-package*/
 # Logs
 *.log
 logs/
+
+# BitNet / bitnet.cpp
+bitnet-cpp/
+bitnet/benchmark_results.json
+*.gguf

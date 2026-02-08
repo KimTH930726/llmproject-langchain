@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import analysis, chat, upload
+from app.api import analysis, chat, upload, bitnet
 
 
 app = FastAPI(
@@ -28,6 +28,7 @@ app.add_middleware(
 app.include_router(analysis.router)     # 지원자 분석 API
 app.include_router(chat.router)         # Tool-based Agent 채팅 API
 app.include_router(upload.router)       # 문서 업로드 API
+app.include_router(bitnet.router)      # BitNet b1.58 CPU 추론 API
 
 @app.get("/")
 async def root():
@@ -41,7 +42,8 @@ async def root():
             "문서 검색 (search_documents tool)",
             "데이터베이스 조회 (query_database tool)",
             "일반 대화 (general_conversation tool)",
-            "LangSmith 자동 추적"
+            "LangSmith 자동 추적",
+            "BitNet b1.58 CPU 추론 (1-bit LLM)"
         ]
     }
 
